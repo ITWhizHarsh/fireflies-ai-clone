@@ -210,3 +210,89 @@ npm test
 | LLM | Google Gemini 2.5 Flash (google-genai SDK) |
 | PDF Export | ReportLab |
 | Property Tests | Hypothesis (Python), fast-check (TypeScript) |
+
+## Database Schema
+
+The database is SQLite, managed by SQLAlchemy 2.x with Alembic migrations. Foreign keys are enforced via `PRAGMA foreign_keys = ON` and all child tables use `ON DELETE CASCADE` so deleting a meeting removes every related row in one operation. Timestamps are stored as Unix epoch integers for portability.
+
+### Tables
+
+| Table | Purpose |
+|-------|---------|
+| `meetings` | Core meeting record — title, date, duration, optional media URL, created/updated timestamps |
+| `participants` | 0-to-N participant names per meeting, ordered by `position` |
+| `transcript_segments` | Normalized transcript rows — speaker label, start/end times (seconds), text, segment index |
+| `summaries` | One-to-one with meetings — stores summary text and generation status (`none` / `seeded` / `generated` / `failed`) |
+| `action_items` | Per-meeting action items with completion flag and timestamps |
+| `key_topics` | Ordered list of topics/chapters extracted from the summary |
+| `comments` | Per-segment comments (bonus annotation feature) |
+| `highlights` | At most one highlight per segment with a color value (bonus) |
+| `soundbites` | Time-range clips referencing a meeting (bonus) |
+| `tags` | Global tag registry, case-insensitively unique |
+| `meeting_tags` | Many-to-many join between meetings and tags |
+| `chat_messages` | Per-meeting chat history with `user` / `assistant` roles (bonus) |
+
+### Key Design Decisions
+
+- **`transcript_segments.segment_index`** — preserves exact source order from the uploaded file, which is required for the parse → serialize round-trip property.
+- **`summaries.generation_status`** — separates "never generated", "AI generated", "seeded", and "failed" so the UI can show the right placeholder and the backend can record errors without overwriting prior data.
+- **`tags.name COLLATE NOCASE`** — tag names are deduplicated case-insensitively at the DB level.
+- **`meeting_tags` composite primary key** — prevents duplicate tag associations at the schema level without an extra unique index.
+- **Indexes** — `(meeting_date DESC, title ASC)` on meetings backs the default library sort; `(meeting_id, segment_index)` and `(meeting_id, start_time)` on segments back ordered rendering and active-segment lookup during media playback.
+
+### ER Diagram
+
+```
+meetings ──< participants
+meetings ──< transcript_segments ──< comments
+                                 ──< highlights
+meetings ──  summaries
+meetings ──< action_items
+meetings ──< key_topics
+meetings ──< soundbites
+meetings ──< meeting_tags >── tags
+meetings ──< chat_messages
+```
+
+---
+
+## Assumptions & Scoping Decisions
+
+### Authentication
+No authentication is implemented. All data belongs to a single implicit `Default_User`. This was explicitly out of scope per the assignment brief, which focuses on core meeting-intelligence features.
+
+### Speech-to-Text
+Real audio transcription is out of scope. Transcripts are provided via three input paths:
+- **Seeded data** — 5 realistic meetings auto-seeded on first startup
+- **File upload** — `.txt`, `.vtt` (WebVTT), or `.json` transcript files
+- **Paste** — raw transcript text pasted directly into the create modal
+
+### LLM Integration
+The Gemini API (`gemini-2.5-flash`) is used when `GEMINI_API_KEY` is set. When no key is configured the app falls back to a deterministic `MockSummaryProvider` that returns a canned summary, action items, and key topics — so the entire app is functional without any API credentials.
+
+The new `google-genai` SDK is used instead of the deprecated `google-generativeai` package because it supports the `AQ.` key format issued by Google AI Studio.
+
+### Media Playback
+A real audio/video file is not bundled. The `media_url` field on each meeting is nullable. The media player renders a seek bar and time display, and handles the error state gracefully — all transcript segments, highlights, and click-to-seek remain fully functional regardless of whether a media source loads.
+
+### Database
+SQLite was chosen as required by the assignment. For production use the `DATABASE_URL` can be switched to a PostgreSQL connection string with the appropriate SQLAlchemy driver (`asyncpg` or `psycopg2`); no model changes are needed. For Render deployments a persistent disk mount is required to survive deploys.
+
+### Search
+Full-text search uses SQLite's `LIKE`-based case-insensitive partial matching rather than FTS5. This covers all search requirements (title, participant, summary, transcript) without requiring a specific SQLite build flag. FTS5 would be the upgrade path for larger datasets.
+
+### Transcript Parsing
+- **`.txt`** — lines starting with `Speaker:` or `HH:MM:SS Speaker:` patterns are parsed as segments; consecutive lines from the same speaker are merged.
+- **`.vtt`** — standard WebVTT cue blocks are parsed; speaker labels are extracted from voice-span notation (`<v Speaker>`) or defaulted to `Speaker`.
+- **`.json`** — expects the normalized `{ "version": 1, "segments": [...] }` format produced by the app's own export.
+
+Any file that yields zero parseable segments is rejected with a `422` error and no partial meeting is created.
+
+### Export
+PDF export uses ReportLab (pure Python, no system dependencies). Markdown and plain-text exports are generated in-memory and streamed as file downloads. Export is available for both the transcript and the AI summary, in all three formats.
+
+### Participants
+Up to 100 participants are allowed on create; up to 50 on edit (the edit form is narrower in scope). Participant lists are stored as ordered rows so display order is deterministic.
+
+### Timestamps
+All `created_at` / `updated_at` fields store Unix epoch seconds as integers. The frontend formats them to locale-aware date strings for display.
