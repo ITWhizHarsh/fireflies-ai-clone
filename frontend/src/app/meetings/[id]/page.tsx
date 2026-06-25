@@ -179,6 +179,7 @@ export default function MeetingDetailPage() {
             mediaUrl={meeting.media_url}
             onTimeUpdate={handleTimeUpdate}
             seekTo={seekTo}
+            totalDuration={meeting.duration_seconds}
           />
         </div>
 
